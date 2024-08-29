@@ -52,10 +52,44 @@ type ImportMetadata = {
   sourceFileSize: number;
 };
 
+type Task = () => Promise<void>;
+
+class FFmpegQueue {
+  private queue: (() => Promise<void>)[] = [];
+  private running = false;
+
+  add(task: () => Promise<void>) {
+    this.queue.push(task);
+    this.runNext();
+  }
+
+  private async runNext() {
+    if (this.running || this.queue.length === 0) {
+      return;
+    }
+
+    this.running = true;
+    const task = this.queue.shift();
+    if (task) {
+      try {
+        await task();
+      } catch (e) {
+        console.error('FFmpeg task failed', e);
+      }
+    }
+    this.running = false;
+    this.runNext();
+  }
+}
+
+const ffmpegQueue = new FFmpegQueue();
+
 export async function importMediaFile(
   filePath: string,
   workingDirPath: string,
-  onProgress: (progress: string) => void
+  onProgress: (progress: string) => void,
+  idx: number | undefined = undefined,
+  totalLength: number | undefined = undefined
 ): Promise<ImportMetadata> {
   const videoName = basename(filePath);
 
@@ -80,49 +114,62 @@ export async function importMediaFile(
   const egFramesFile = `${fileSha256}.eg.data`;
   try {
     onProgress('Extracting audio');
-    await extractAudioToMP3(filePath, audioFilePath);
-
+    await new Promise<void>((resolve, reject) => {
+      ffmpegQueue.add(async () => {
+        try {
+          await extractAudioToMP3(filePath, audioFilePath);
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
     audioFile = audioFileNameRelative;
   } catch (e) {
-    // console.error('Failed to extract audio for ' + filePath, e);
+    console.error('Failed to extract audio for ' + filePath, e);
     audioFile = null;
   }
-  // return new Promise<DBFile>((resolve, reject) => {
+
   onProgress('Gathering Metadata');
-  const dimensionsProbeData = await exec(
-    ffprobePath,
-    ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', filePath],
-    { stdio: ['ignore', 'ignore', 'ignore'] }
-  );
+  const dimensionsProbeData = await execPromise(ffprobePath, [
+    '-v',
+    'error',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=width,height',
+    '-of',
+    'csv=p=0:s=x',
+    filePath,
+  ]);
   const dimensions = dimensionsProbeData.trim().split('x').map(Number);
   let width = dimensions[0];
   let height = dimensions[1];
 
   // count frames:
-  const frameCountProbeData = await exec(
-    ffprobePath,
-    [
-      '-v',
-      'error',
-      '-count_frames',
-      '-select_streams',
-      'v:0',
-      '-show_entries',
-      'stream=nb_read_frames',
-      '-of',
-      'default=noprint_wrappers=1:nokey=1',
-      filePath,
-    ],
-    { stdio: ['ignore', 'ignore', 'ignore'] }
-  );
-
+  const frameCountProbeData = await execPromise(ffprobePath, [
+    '-v',
+    'error',
+    '-count_frames',
+    '-select_streams',
+    'v:0',
+    '-show_entries',
+    'stream=nb_read_frames',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ]);
   const frameCount = Number(frameCountProbeData.trim());
 
-  const durationProbeData = await exec(
-    ffprobePath,
-    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath],
-    { stdio: ['ignore', 'ignore', 'ignore'] }
-  );
+  const durationProbeData = await execPromise(ffprobePath, [
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ]);
   const durationInSeconds = parseFloat(durationProbeData.trim());
   // console.log(`Video duration: ${durationInSeconds} seconds`);
   // console.log(`Video dimensions: ${width}x${height}`);
@@ -134,21 +181,29 @@ export async function importMediaFile(
     const cropY = (height - newDimension) / 2;
     squareFilePath = join(workingDirPath, `${fileSha256}.square.mp4`);
     onProgress('Cropping video');
-    await exec(
-      ffmpegPath,
-      [
-        '-i',
-        filePath,
-        '-vf',
-        `crop=${newDimension}:${newDimension}:${cropX}:${cropY}`,
-        '-y', // overwrite
-        '-c:a', // copy audio
-        'copy',
-        squareFilePath,
-      ],
-      { stdio: ['ignore', 'ignore', 'ignore'] }
-    );
-    // console.log('Cropped video to square:', squareFilePath);
+    let command = [
+      '-hwaccel',
+      'videotoolbox',
+      '-i',
+      filePath,
+      '-vf',
+      `crop=${newDimension}:${newDimension}:${cropX}:${cropY}`,
+      '-y', // overwrite
+      '-c:a', // copy audio
+      'copy',
+      squareFilePath,
+    ];
+    console.log(`running command ${ffmpegPath} ${command.join(' ')}`);
+    await new Promise<void>((resolve, reject) => {
+      ffmpegQueue.add(async () => {
+        try {
+          await execPromise(ffmpegPath, command);
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
     width = newDimension;
     height = newDimension;
   }
@@ -195,75 +250,90 @@ export async function importMediaFile(
     unlinkSync(outputDataFile);
     // console.log('removed existing file ', outputDataFile);
   } catch (e) {
-    // console.warn('Failed to delete existing file', outputDataFile)
+    console.warn('Failed to delete existing file', outputDataFile);
   }
 
   writeFileSync(outputDataFile, Buffer.alloc(0));
-
-  const ffmpeg = spawn(ffmpegPath, [
-    '-i',
-    squareFilePath,
-    '-f',
-    format,
-    '-vf',
-    `scale=${width}:${height}`,
-    '-pix_fmt',
-    'rgb24',
-    '-',
-  ]);
-
-  ffmpeg.stdout.on('data', (chunk: Buffer) => {
-    videoBuffer = Buffer.concat([videoBuffer, chunk]);
-
-    while (videoBuffer.length >= frameSize) {
-      const frame = videoBuffer.slice(0, frameSize);
-      processFrame(frame);
-      videoBuffer = videoBuffer.slice(frameSize);
-    }
-  });
-
-  // ffmpeg.stderr.on('data', (data) => {
-  //   console.error(`stderr: ${data}`)
-  // });
-  const startTime = Date.now();
-
   const frameOutputBuffer = new Uint8Array(egStageMap.length * 3);
 
   const fsWriter = createWriteStream(outputDataFile, {
     encoding: 'binary',
   });
 
-  // const compressionWriter = zlib.createBrotliCompress({
-  //   params: {
-  //     [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_GENERIC,
-  //     [zlib.constants.BROTLI_PARAM_QUALITY]: zlib.constants.BROTLI_MAX_QUALITY,
-  //   },
-  // })
+  return new Promise<ImportMetadata>((resolve, reject) => {
+    let command = [
+      '-hwaccel',
+      'videotoolbox',
+      '-i',
+      squareFilePath,
+      '-f',
+      format,
+      '-vf',
+      `scale=${width}:${height}`,
+      '-pix_fmt',
+      'rgb24',
+      '-',
+    ];
+    console.log(`running command ${ffmpegPath} ${command.join(' ')}`);
+    ffmpegQueue.add(async () => {
+      const ffmpeg = spawn(ffmpegPath, command);
 
-  // compressionWriter.pipe(fsWriter)
-  return await new Promise<ImportMetadata>((resolve, reject) => {
-    ffmpeg.on('close', (code: string | number) => {
-      // console.log(`ffmpeg process exited with code ${code}`);
-      const endTime = Date.now();
-      const duration = endTime - startTime;
-      const conversionDuration = duration / 1000;
-      // console.log('Done in ' + durationInSeconds + ' seconds');
-      // compressionWriter.close()
-      fsWriter.close();
-      resolve({
-        fileSha256,
-        width,
-        height,
-        conversionDuration,
-        frameCount,
-        duration: durationInSeconds,
-        completeTime: endTime,
-        videoName,
-        filePath,
-        egFramesFile,
-        audioFile,
-        importerVersion,
-        sourceFileSize: fileInfo.size,
+      ffmpeg.stdout.on('data', (chunk: Buffer) => {
+        videoBuffer = Buffer.concat([videoBuffer, chunk]);
+
+        while (videoBuffer.length >= frameSize) {
+          const frame = videoBuffer.slice(0, frameSize);
+          processFrame(frame);
+          videoBuffer = videoBuffer.slice(frameSize);
+        }
+      });
+
+      ffmpeg.stderr.on('data', (data) => {
+        console.error(`[${filePath}] stderr: ${data}`);
+      });
+
+      const startTime = Date.now();
+
+      // const compressionWriter = zlib.createBrotliCompress({
+      //   params: {
+      //     [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_GENERIC,
+      //     [zlib.constants.BROTLI_PARAM_QUALITY]: zlib.constants.BROTLI_MAX_QUALITY,
+      //   },
+      // })
+
+      // compressionWriter.pipe(fsWriter)
+
+      ffmpeg.on('close', (code: string | number) => {
+        if (code !== 0) {
+          reject(new Error(`ffmpeg process exited with code ${code}`));
+          return;
+        }
+        const endTime = Date.now();
+        const duration = endTime - startTime;
+        const conversionDuration = duration / 1000;
+        // console.log('Done in ' + durationInSeconds + ' seconds');
+        // compressionWriter.close()
+        fsWriter.close();
+        resolve({
+          fileSha256,
+          width,
+          height,
+          conversionDuration,
+          frameCount,
+          duration: durationInSeconds,
+          completeTime: endTime,
+          videoName,
+          filePath,
+          egFramesFile,
+          audioFile,
+          importerVersion,
+          sourceFileSize: fileInfo.size,
+        });
+      });
+
+      ffmpeg.on('error', (err) => {
+        console.error(`ffmpeg error: ${err}`);
+        reject(err);
       });
     });
   });
@@ -337,6 +407,18 @@ export async function importMediaFile(
 
     appendFile(frameOutputBuffer);
   }
+}
+
+function execPromise(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(stdout.toString());
+      }
+    });
+  });
 }
 
 function calculateChecksum(filePath: string): Promise<string> {

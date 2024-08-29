@@ -143,7 +143,7 @@ export function egVideo(
       handleFrameIndexUpdate(0);
       let totalBufferRead = 0;
       const readbackInstance = playCount++;
-      console.log('startReadbackForward', readbackInstance);
+      // console.log('startReadbackForward', readbackInstance);
 
       streamPaused = false;
 
